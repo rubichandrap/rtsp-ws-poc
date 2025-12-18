@@ -26,6 +26,20 @@ app.use(express.json());
 const PORT = 3001;
 const activeStreams: Map<string, Readable> = new Map();
 
+// If the last client for a session disconnects, stop the RTSP ffmpeg process.
+// We use a short delay to allow PassThrough cleanup events to decrement client counts
+// (the RTSP service updates `clientCount` on stream 'close'/'end' events).
+const maybeStopSessionIfIdle = (sessionId: string, delayMs = 100) => {
+  setTimeout(() => {
+    const status = rtspService.getSessionStatus(sessionId);
+    if (!status) return;
+    if (status.isActive && status.clientCount === 0) {
+      console.info(`No clients remaining for ${sessionId}; stopping stream.`);
+      rtspService.stopStream(sessionId);
+    }
+  }, delayMs);
+};
+
 // REST Endpoints
 
 app.post('/api/stream/start', async (req: Request, res: Response) => {
@@ -172,6 +186,9 @@ io.on('connection', (socket) => {
         activeStreams.delete(streamKey);
       }
       socket.removeAllListeners('stream:unwatch');
+
+      // Give the RTSP service a moment to update client counts, then stop ffmpeg if there are no clients left
+      maybeStopSessionIfIdle(sessionId);
     });
   });
 
@@ -179,16 +196,24 @@ io.on('connection', (socket) => {
     console.log(`Client disconnected: ${socket.id}`);
 
     const keysToDelete: string[] = [];
+    const affectedSessionIds = new Set<string>();
+
     activeStreams.forEach((stream, key) => {
       if (key.includes(socket.id)) {
         stream.destroy();
         keysToDelete.push(key);
+        // key format: `${sessionId}-${socket.id}` -> remove suffix to recover sessionId
+        const sid = key.slice(0, -socket.id.length - 1);
+        affectedSessionIds.add(sid);
       }
     });
 
     keysToDelete.forEach((key) => {
       activeStreams.delete(key);
     });
+
+    // Allow PassThrough cleanup events to run, then stop any idle sessions
+    affectedSessionIds.forEach((sid) => maybeStopSessionIfIdle(sid));
   });
 });
 
